@@ -15,13 +15,13 @@ def update_json_with_csv(original_json_path, updated_csv_path):
 
     # Mapping from CSV back to JSON
     for field in data.get('fieldTranslations', []):
-        # Find CSV rows corresponding to the current JSON field
-        field_rows = [row for row in csv_data if row['field_id'] == field['id'] and row['enum_id'] == '']
-
-        # Update the field's label translation if any rows match
-        if field_rows:
-            field['label']['translation'] = field_rows[0]['translation']
-            field['label']['hash'] = field_rows[0]['hash'][1:]  # Remove the '#' from the hash
+        if 'label' in field:  # Check if 'label' key exists
+            # Find CSV rows corresponding to the current JSON field
+            field_rows = [row for row in csv_data if row['field_id'] == field['id'] and row['enum_id'] == '']
+            # Update the field's label translation if any rows match
+            if field_rows:
+                field['label']['translation'] = field_rows[0]['translation']
+                field['label']['hash'] = field_rows[0]['hash'][1:]  # Remove the '#' from the hash
 
         # Update enum translations if any
         if 'enum' in field:
