@@ -24,6 +24,7 @@ Setup Step 4 (automatic triggering when logic becomes true) is configured in RED
 1. `generate_allocation.R` — core generator (base R).
 2. `REDCap_Randomize.R` — command-line entry point; launches Shiny if run with no arguments.
 3. `app.R` — Shiny UI that follows Setup Step 1 A/B/C (strata, group/site, randomization field).
+4. `manifest.json` — R package list for [Posit Connect Cloud](https://docs.posit.co/connect-cloud/how-to/r/dependencies.html). Primary file: `Randomisation/app.R`. Regenerate with `rsconnect::writeManifest(appPrimaryDoc = "app.R")` from this folder.
 
 #### Shiny app
 
