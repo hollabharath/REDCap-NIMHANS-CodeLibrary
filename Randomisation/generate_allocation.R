@@ -50,6 +50,29 @@ parse_strata_spec <- function(x) {
   out
 }
 
+# "1=40,2=30,3=30" -> named numeric vector
+parse_quota_spec <- function(x) {
+  if (is_blank(x)) {
+    return(NULL)
+  }
+  parts <- trim_chr(unlist(strsplit(as.character(x), ",", fixed = TRUE)))
+  parts <- parts[nzchar(parts)]
+  out <- numeric(0)
+  for (part in parts) {
+    if (!grepl("=", part, fixed = TRUE)) {
+      stop("Site quota must look like code=n, e.g. 1=40,2=30 (got: ", part, ")", call. = FALSE)
+    }
+    kv <- strsplit(part, "=", fixed = TRUE)[[1]]
+    name <- trim_chr(kv[[1]])
+    val <- suppressWarnings(as.numeric(trim_chr(paste(kv[-1], collapse = "="))))
+    if (!nzchar(name) || is.na(val) || val <= 0) {
+      stop("Site quota entries need a code and a positive number: ", part, call. = FALSE)
+    }
+    out[[name]] <- val
+  }
+  out
+}
+
 valid_redcap_variable <- function(x) {
   grepl("^[a-z][a-z0-9_]*$", x)
 }
@@ -221,6 +244,37 @@ validate_params <- function(p) {
   if (!is.null(p$n_per_stratum) && (is.na(p$n_per_stratum) || p$n_per_stratum < 1)) {
     errs <- c(errs, "n_per_stratum must be a positive integer if provided.")
   }
+  if (!is.null(p$site_quota) && !is.null(p$site_ratio)) {
+    errs <- c(errs, "Use either site_quota or site_ratio, not both.")
+  }
+  if (!is.null(p$site_quota) || !is.null(p$site_ratio)) {
+    if (is.null(p$site)) {
+      errs <- c(errs, "site_quota / site_ratio require a site or DAG field.")
+    } else {
+      site_vals <- as.character(p$site$values)
+      if (!is.null(p$site_quota)) {
+        missing <- setdiff(site_vals, names(p$site_quota))
+        extra <- setdiff(names(p$site_quota), site_vals)
+        if (length(missing)) {
+          errs <- c(errs, paste("site_quota missing codes:", paste(missing, collapse = ", ")))
+        }
+        if (length(extra)) {
+          errs <- c(errs, paste("site_quota has unknown codes:", paste(extra, collapse = ", ")))
+        }
+      }
+      if (!is.null(p$site_ratio)) {
+        if (length(p$site_ratio) != length(site_vals) || any(is.na(p$site_ratio)) || any(p$site_ratio < 1)) {
+          errs <- c(errs, paste0(
+            "site_ratio needs one positive integer per site code (got ",
+            length(p$site_ratio), " values for ", length(site_vals), " sites)."
+          ))
+        }
+      }
+    }
+  }
+  if (!is.null(p$n_per_stratum) && (!is.null(p$site_quota) || !is.null(p$site_ratio))) {
+    errs <- c(errs, "Do not combine n_per_stratum with site_quota / site_ratio.")
+  }
   if (!is.null(p$seed) && (is.na(p$seed) || p$seed < 0)) {
     errs <- c(errs, "Seed must be a non-negative integer.")
   }
@@ -257,6 +311,7 @@ generate_block <- function(arms, ratio, block_size) {
 
 # Concatenate random-sized permuted blocks until at least n_min assignments exist.
 # The last block is kept in full so within-stratum ratios stay exact.
+# (Used only when equalize = FALSE; lengths can differ slightly across combinations.)
 generate_stratum_sequence <- function(n_min, arms, ratio, block_sizes) {
   seqv <- character(0)
   while (length(seqv) < n_min) {
@@ -264,6 +319,155 @@ generate_stratum_sequence <- function(n_min, arms, ratio, block_sizes) {
     seqv <- c(seqv, generate_block(arms, ratio, bs))
   }
   seqv
+}
+
+# Smallest length >= n that can be formed as a sum of the given block sizes.
+round_up_achievable <- function(n, block_sizes) {
+  n <- as.integer(n)
+  block_sizes <- sort(unique(as.integer(block_sizes)))
+  if (n <= 0) {
+    return(min(block_sizes))
+  }
+  max_b <- max(block_sizes)
+  limit <- n + max_b * length(block_sizes)
+  can <- rep(FALSE, limit + 1L)
+  can[1L] <- TRUE
+  for (s in 0:limit) {
+    if (!can[s + 1L]) {
+      next
+    }
+    for (b in block_sizes) {
+      nxt <- s + b
+      if (nxt <= limit) {
+        can[nxt + 1L] <- TRUE
+      }
+    }
+  }
+  for (t in n:limit) {
+    if (can[t + 1L]) {
+      return(as.integer(t))
+    }
+  }
+  stop("Cannot reach a length >= ", n, " with block sizes ", paste(block_sizes, collapse = ","), call. = FALSE)
+}
+
+# Plan a multiset of block sizes that sum exactly to n_target, then shuffle order.
+plan_block_sizes <- function(n_target, block_sizes) {
+  n_target <- as.integer(n_target)
+  block_sizes <- sort(unique(as.integer(block_sizes)), decreasing = TRUE)
+  can <- rep(FALSE, n_target + 1L)
+  prev_block <- rep(NA_integer_, n_target + 1L)
+  can[1L] <- TRUE
+  for (s in 0:n_target) {
+    if (!can[s + 1L]) {
+      next
+    }
+    for (b in block_sizes) {
+      nxt <- s + b
+      if (nxt <= n_target && !can[nxt + 1L]) {
+        can[nxt + 1L] <- TRUE
+        prev_block[nxt + 1L] <- b
+      }
+    }
+  }
+  if (!can[n_target + 1L]) {
+    n_target <- round_up_achievable(n_target, block_sizes)
+    return(plan_block_sizes(n_target, block_sizes))
+  }
+  out <- integer(0)
+  s <- n_target
+  while (s > 0) {
+    b <- prev_block[s + 1L]
+    out <- c(b, out)
+    s <- s - b
+  }
+  if (length(out) > 1) {
+    out <- sample(out)
+  }
+  out
+}
+
+# Exact-length sequence: block sizes planned to sum to n_target (after rounding up).
+generate_stratum_sequence_exact <- function(n_target, arms, ratio, block_sizes) {
+  n_target <- round_up_achievable(n_target, block_sizes)
+  plan <- plan_block_sizes(n_target, block_sizes)
+  unlist(lapply(plan, function(bs) generate_block(arms, ratio, bs)), use.names = FALSE)
+}
+
+# Per-combination row targets (before/at exact length).
+compute_combo_targets <- function(p, grid) {
+  n_combos <- if (is.null(grid)) 1L else nrow(grid)
+  target_total <- ceiling(p$n * (1 + p$buffer))
+
+  if (!is.null(p$n_per_stratum)) {
+    targets <- rep(as.integer(p$n_per_stratum), n_combos)
+  } else if (!is.null(p$site) && (!is.null(p$site_quota) || !is.null(p$site_ratio))) {
+    site_name <- p$site$name
+    site_vals <- as.character(p$site$values)
+    if (!is.null(p$site_quota)) {
+      budgets <- vapply(site_vals, function(v) {
+        q <- p$site_quota[[v]]
+        if (is.null(q) || is.na(q)) {
+          stop("Site quota missing for code: ", v, call. = FALSE)
+        }
+        as.integer(ceiling(q * (1 + p$buffer)))
+      }, integer(1))
+    } else {
+      w <- as.numeric(p$site_ratio)
+      budgets <- as.integer(round(target_total * w / sum(w)))
+      drift <- target_total - sum(budgets)
+      if (drift != 0) {
+        budgets[1] <- budgets[1] + drift
+      }
+    }
+    names(budgets) <- site_vals
+    n_within <- if (length(p$strata) == 0) 1L else nrow(factor_grid(p$strata))
+    targets <- integer(n_combos)
+    for (i in seq_len(n_combos)) {
+      sv <- as.character(grid[i, site_name])
+      targets[i] <- as.integer(ceiling(budgets[[sv]] / n_within))
+    }
+  } else {
+    targets <- rep(as.integer(ceiling(target_total / n_combos)), n_combos)
+  }
+
+  if (isTRUE(p$equalize) && n_combos > 1L && !is.null(grid) && !is.null(p$site) &&
+      (!is.null(p$site_quota) || !is.null(p$site_ratio))) {
+    site_name <- p$site$name
+    for (sv in unique(as.character(grid[[site_name]]))) {
+      idx <- which(as.character(grid[[site_name]]) == sv)
+      targets[idx] <- max(targets[idx])
+    }
+  } else if (isTRUE(p$equalize) && n_combos > 1L) {
+    targets <- rep(max(targets), n_combos)
+  }
+
+  if (isTRUE(p$equalize)) {
+    targets <- vapply(targets, function(t) round_up_achievable(t, p$block_sizes), integer(1))
+    if (is.null(p$site) || (is.null(p$site_quota) && is.null(p$site_ratio))) {
+      targets <- rep(max(targets), length(targets))
+    } else if (!is.null(grid)) {
+      site_name <- p$site$name
+      for (sv in unique(as.character(grid[[site_name]]))) {
+        idx <- which(as.character(grid[[site_name]]) == sv)
+        targets[idx] <- max(targets[idx])
+      }
+    }
+  }
+  targets
+}
+
+format_site_totals <- function(df, p) {
+  if (is.null(p$site) || !p$site$name %in% names(df)) {
+    return(character(0))
+  }
+  sn <- p$site$name
+  tab <- as.data.frame(table(site = df[[sn]]), stringsAsFactors = FALSE)
+  names(tab)[1] <- sn
+  c(
+    "Rows by site (development table):",
+    capture.output(print(tab, row.names = FALSE))
+  )
 }
 
 default_code_alphabet <- function(exclude_ambiguous = FALSE) {
@@ -341,7 +545,10 @@ normalize_params <- function(
     code_length = 3L,
     exclude_ambiguous = FALSE,
     include_group_col = TRUE,
-    include_rand_number = FALSE) {
+    include_rand_number = FALSE,
+    equalize = TRUE,
+    site_quota = NULL,
+    site_ratio = NULL) {
   field <- trim_chr(field)
   arms <- trim_chr(arms)
   type <- match.arg(type, c("open", "blinded"))
@@ -367,6 +574,19 @@ normalize_params <- function(
   } else {
     seed_prod <- as.integer(prod_seed)
   }
+  if (is.character(site_quota) || (is.list(site_quota) && !is.null(names(site_quota)))) {
+    # already named numeric from parse_quota_spec, or character to parse
+  }
+  if (is.character(site_quota) && length(site_quota) == 1) {
+    site_quota <- parse_quota_spec(site_quota)
+  }
+  if (!is.null(site_quota)) {
+    site_quota <- unlist(site_quota)
+    names(site_quota) <- as.character(names(site_quota))
+  }
+  if (!is.null(site_ratio)) {
+    site_ratio <- as.integer(site_ratio)
+  }
   list(
     n = as.integer(n),
     field = field,
@@ -389,7 +609,10 @@ normalize_params <- function(
     exclude_ambiguous = isTRUE(exclude_ambiguous),
     code_alphabet = default_code_alphabet(exclude_ambiguous),
     include_group_col = isTRUE(include_group_col),
-    include_rand_number = isTRUE(include_rand_number) && type == "open"
+    include_rand_number = isTRUE(include_rand_number) && type == "open",
+    equalize = isTRUE(equalize),
+    site_quota = site_quota,
+    site_ratio = site_ratio
   )
 }
 
@@ -401,15 +624,15 @@ build_one_table <- function(p, seed) {
   }
   grid <- factor_grid(factors)
   n_combos <- if (is.null(grid)) 1L else nrow(grid)
-  target_total <- ceiling(p$n * (1 + p$buffer))
-  n_min <- if (!is.null(p$n_per_stratum)) {
-    p$n_per_stratum
-  } else {
-    as.integer(ceiling(target_total / n_combos))
-  }
+  targets <- compute_combo_targets(p, grid)
 
-  make_chunk <- function(combo = NULL) {
-    seq_arms <- generate_stratum_sequence(n_min, p$arms, p$ratio, p$block_sizes)
+  make_chunk <- function(i, combo = NULL) {
+    n_target <- targets[[i]]
+    if (isTRUE(p$equalize)) {
+      seq_arms <- generate_stratum_sequence_exact(n_target, p$arms, p$ratio, p$block_sizes)
+    } else {
+      seq_arms <- generate_stratum_sequence(n_target, p$arms, p$ratio, p$block_sizes)
+    }
     out <- setNames(data.frame(seq_arms, stringsAsFactors = FALSE), p$field)
     if (!is.null(combo)) {
       extra <- combo[rep(1, length(seq_arms)), , drop = FALSE]
@@ -419,15 +642,16 @@ build_one_table <- function(p, seed) {
   }
 
   if (is.null(grid)) {
-    df <- make_chunk(NULL)
+    df <- make_chunk(1L, NULL)
   } else {
-    chunks <- lapply(seq_len(n_combos), function(i) make_chunk(grid[i, , drop = FALSE]))
+    chunks <- lapply(seq_len(n_combos), function(i) make_chunk(i, grid[i, , drop = FALSE]))
     df <- do.call(rbind, chunks)
   }
   rownames(df) <- NULL
   keep <- c(p$field, names(factors))
   df <- df[, keep, drop = FALSE]
   df[] <- lapply(df, as.character)
+  attr(df, "combo_targets") <- targets
   df
 }
 
@@ -520,7 +744,7 @@ format_balance <- function(df, p) {
   capture.output(print(counts, row.names = FALSE))
 }
 
-build_log <- function(p, dev, prod, n_combos, n_min, warnings = character(0)) {
+build_log <- function(p, dev, prod, n_combos, combo_targets, warnings = character(0)) {
   lines <- c(
     "REDCap randomization allocation table",
     paste("Generated:", format(Sys.time(), "%Y-%m-%d %H:%M:%S")),
@@ -539,11 +763,28 @@ build_log <- function(p, dev, prod, n_combos, n_min, warnings = character(0)) {
     paste("  Block sizes:          ", paste(p$block_sizes, collapse = ", ")),
     paste("  Target N:             ", p$n),
     paste("  Buffer:               ", paste0(round(100 * p$buffer), "%")),
-    paste("  Min. per combination: ", n_min),
+    paste("  Equalize lengths:     ", if (isTRUE(p$equalize)) {
+      "yes (exact common length per combination; no random overshoot)"
+    } else {
+      "no (variable overshoot — site totals may differ by a few rows)"
+    }),
+    paste("  Rows per combination: ", paste(unique(combo_targets), collapse = " / ")),
     paste("  Combinations:         ", n_combos),
     paste("  Rows generated (dev): ", nrow(dev)),
     paste("  Rows generated (prod):", nrow(prod))
   )
+  if (!is.null(p$site_quota)) {
+    lines <- c(lines, paste(
+      "  Site quotas (pre-buffer):",
+      paste(sprintf("%s=%s", names(p$site_quota), p$site_quota), collapse = ", ")
+    ))
+  }
+  if (!is.null(p$site_ratio)) {
+    lines <- c(lines, paste(
+      "  Site ratio weights:    ",
+      paste(sprintf("%s=%s", p$site$values, p$site_ratio), collapse = ", ")
+    ))
+  }
   if (identical(p$type, "blinded")) {
     lines <- c(
       lines,
@@ -585,6 +826,13 @@ build_log <- function(p, dev, prod, n_combos, n_min, warnings = character(0)) {
     "",
     "Method: permuted-block randomization generated independently within each",
     "stratum x group/site combination. REDCap assigns the next unused matching row.",
+    if (isTRUE(p$equalize)) {
+      "Exact block plans sum to the target length so combination (and equal-site) totals match."
+    } else {
+      "Variable block overshoot is enabled; totals can differ slightly across sites."
+    },
+    "",
+    format_site_totals(dev, p),
     "",
     "REDCap upload reminders:",
     "  - Do not include record IDs. Do not add block_no or internal shuffle columns.",
@@ -673,7 +921,7 @@ finalize_tables <- function(p, dev_raw, prod_raw) {
   )
 }
 
-# Returns list(dev, prod, mapping_dev, mapping_prod, log, params, n_combos, n_min, warnings)
+# Returns list(dev, prod, mapping_dev, mapping_prod, log, params, n_combos, combo_targets, warnings)
 generate_allocation_tables <- function(...) {
   p <- normalize_params(...)
   errs <- validate_params(p)
@@ -681,12 +929,17 @@ generate_allocation_tables <- function(...) {
     stop(paste(errs, collapse = "\n"), call. = FALSE)
   }
 
-  n_combos <- count_stratum_combos(p)
-  target_total <- ceiling(p$n * (1 + p$buffer))
-  n_min <- if (!is.null(p$n_per_stratum)) p$n_per_stratum else as.integer(ceiling(target_total / n_combos))
-  warnings <- strata_warnings(p, n_combos, n_min)
+  factors <- p$strata
+  if (!is.null(p$site)) {
+    factors[[p$site$name]] <- p$site$values
+  }
+  grid <- factor_grid(factors)
+  n_combos <- if (is.null(grid)) 1L else nrow(grid)
+  combo_targets <- compute_combo_targets(p, grid)
+  warnings <- strata_warnings(p, n_combos, min(combo_targets))
 
   dev_raw <- build_one_table(p, p$seed)
+  combo_targets <- attr(dev_raw, "combo_targets")
   prod_built <- build_prod_raw_distinct(p, dev_raw)
   p <- prod_built$params
   prod_raw <- prod_built$prod_raw
@@ -700,14 +953,15 @@ generate_allocation_tables <- function(...) {
     mapping_dev = finalized$mapping_dev,
     mapping_prod = finalized$mapping_prod,
     n_combos = n_combos,
-    n_min = n_min,
+    combo_targets = combo_targets,
+    n_min = min(combo_targets),
     warnings = warnings,
     log = build_log(
       p,
       log_balance_frame(if (identical(p$type, "blinded")) dev_raw else finalized$dev, p),
       log_balance_frame(if (identical(p$type, "blinded")) prod_raw else finalized$prod, p),
       n_combos,
-      n_min,
+      combo_targets,
       warnings
     )
   )

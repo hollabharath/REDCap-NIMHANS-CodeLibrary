@@ -41,7 +41,11 @@ Command-line mode writes CSVs matching Randomization Setup Step 3.
 Options:
   --n                 Target sample size (default: 120)
   --buffer            Extra assignments as a proportion (default: 0.25)
-  --n-per-stratum     Override: minimum rows per stratum x site combination
+  --n-per-stratum     Override: exact/min rows per stratum x site combination
+  --equalize          Pad combinations to exact equal lengths (default: on)
+  --no-equalize       Allow variable block overshoot (site totals may differ)
+  --site-quota        Planned N per site before buffer, e.g. 1=40,2=30,3=30
+  --site-ratio        Weights matching site code order, e.g. 2,1,1
   --field             Randomization field / REDCap variable (default: randomize)
   --type              open (default) or blinded
   --arms              Comma-separated allocation codes (default: 1,2)
@@ -87,6 +91,10 @@ parse_cli <- function(args) {
     n = 120L,
     buffer = 0.25,
     n_per_stratum = NULL,
+    equalize = TRUE,
+    no_equalize = FALSE,
+    site_quota = NULL,
+    site_ratio = NULL,
     field = "randomize",
     type = "open",
     arms = "1,2",
@@ -115,7 +123,7 @@ parse_cli <- function(args) {
     return(defaults)
   }
 
-  flags <- c("dry-run", "shiny", "help", "exclude-ambiguous", "no-group-col", "include-rand-number")
+  flags <- c("dry-run", "shiny", "help", "exclude-ambiguous", "no-group-col", "include-rand-number", "equalize", "no-equalize")
   i <- 1
   while (i <= length(args)) {
     raw <- args[[i]]
@@ -159,10 +167,29 @@ coerce_cli <- function(opt) {
   opt$exclude_ambiguous <- isTRUE(opt$exclude_ambiguous) || identical(opt$exclude_ambiguous, "TRUE")
   opt$no_group_col <- isTRUE(opt$no_group_col) || identical(opt$no_group_col, "TRUE")
   opt$include_rand_number <- isTRUE(opt$include_rand_number) || identical(opt$include_rand_number, "TRUE")
+  opt$equalize_flag <- isTRUE(opt$equalize) || identical(opt$equalize, "TRUE")
+  opt$no_equalize <- isTRUE(opt$no_equalize) || identical(opt$no_equalize, "TRUE")
+  if (isTRUE(opt$no_equalize)) {
+    opt$equalize <- FALSE
+  } else if (isTRUE(opt$equalize_flag) || identical(opt$equalize, TRUE)) {
+    opt$equalize <- TRUE
+  } else {
+    opt$equalize <- TRUE
+  }
   if (!is.null(opt$n_per_stratum) && !is_blank(opt$n_per_stratum)) {
     opt$n_per_stratum <- as.integer(opt$n_per_stratum)
   } else {
     opt$n_per_stratum <- NULL
+  }
+  if (!is.null(opt$site_quota) && !is_blank(opt$site_quota)) {
+    opt$site_quota <- parse_quota_spec(opt$site_quota)
+  } else {
+    opt$site_quota <- NULL
+  }
+  if (!is.null(opt$site_ratio) && !is_blank(opt$site_ratio)) {
+    opt$site_ratio <- parse_int_csv(opt$site_ratio)
+  } else {
+    opt$site_ratio <- NULL
   }
   if (!is.null(opt$seed) && !is_blank(opt$seed)) {
     opt$seed <- as.integer(opt$seed)
@@ -189,6 +216,9 @@ coerce_cli <- function(opt) {
   opt$strata <- parse_strata_spec(opt$strata)
 
   site <- NULL
+  if (!is.null(opt$site_quota) && !is.null(opt$site_ratio)) {
+    cli_error("Use either --site-quota or --site-ratio, not both.")
+  }
   if (!is_blank(opt$site) && !is_blank(opt$dag)) {
     cli_error("Use either --site or --dag, not both.")
   }
@@ -250,7 +280,10 @@ main <- function(args = commandArgs(trailingOnly = TRUE)) {
     code_length = opt$code_length,
     exclude_ambiguous = opt$exclude_ambiguous,
     include_group_col = !isTRUE(opt$no_group_col),
-    include_rand_number = isTRUE(opt$include_rand_number)
+    include_rand_number = isTRUE(opt$include_rand_number),
+    equalize = isTRUE(opt$equalize),
+    site_quota = opt$site_quota,
+    site_ratio = opt$site_ratio
   )
   if (length(result$warnings)) {
     cat("\nWarnings:\n")

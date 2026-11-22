@@ -16,6 +16,7 @@ These tools follow guidance from the [Seattle Children's REDCap randomization he
 - Open randomization can optionally include `redcap_randomization_number` for the `[rand-number]` smart variable.
 - Strata explosion warnings, DAG ID validation, role/blinding notes in the generation log.
 - A 25% buffer is added by default so drop-ins do not exhaust the list.
+- **Equalize lengths** (default): every stratum × site combination gets the same exact row count (no random 46 vs 48 overshoot). Optional **site quotas** or **site ratio weights** for unequal planned enrollment by site.
 
 Setup Step 4 (automatic triggering when logic becomes true) is configured in REDCap, not in these files. If you use strata, those fields must already be saved before auto-randomization can run.
 
@@ -79,6 +80,24 @@ Rscript REDCap_Randomize.R \
 # Data Access Groups — numeric IDs only (from Step 2 template)
 Rscript REDCap_Randomize.R --n 120 --field randomize --dag "1,2,3" --outdir ./output
 
+# Unequal site quotas (planned N before buffer)
+Rscript REDCap_Randomize.R \
+  --n 100 \
+  --field randomize \
+  --site "site=1,2,3" \
+  --site-quota "1=40,2=30,3=30" \
+  --block-sizes 4,6 \
+  --seed 42 \
+  --outdir ./output
+
+# Unequal site ratio weights (same order as site codes)
+Rscript REDCap_Randomize.R \
+  --n 120 \
+  --field randomize \
+  --site "site=1,2,3" \
+  --site-ratio 2,1,1 \
+  --outdir ./output
+
 # Second randomization model in the same project (platform / SMART trial)
 Rscript REDCap_Randomize.R \
   --n 80 \
@@ -100,6 +119,9 @@ Rscript REDCap_Randomize.R --help
 | `--strata` | `name=v1,v2;name2=v1,v2` (Setup Step 1A; max 14 fields) |
 | `--site` | `name=v1,v2` (Setup Step 1B, a field) |
 | `--dag` | Numeric DAG group IDs from the Step 2 template |
+| `--equalize` / `--no-equalize` | Exact equal lengths per combination (default on) |
+| `--site-quota` | Planned N per site before buffer, e.g. `1=40,2=30` |
+| `--site-ratio` | Weights in site-code order, e.g. `2,1,1` |
 | `--block-sizes` | Multiples of the ratio total; default `4,6,8` for 1:1 |
 | `--include-rand-number` | Open only: add `redcap_randomization_number` column |
 | `--code-style` / `--code-length` | Concealed code style (blinded mode) |
@@ -124,7 +146,7 @@ Rscript REDCap_Randomize.R --help
 
 #### Method
 
-For every combination of stratum codes (and group/site if used), the generator draws random block sizes, fills each block with the allocation ratio, permutes the block, and concatenates blocks until that combination has at least `ceil(N × (1 + buffer) / combinations)` rows. REDCap assigns the next unused matching row in list order.
+For every combination of stratum codes (and group/site if used), the generator builds a permuted-block sequence. With **equalize** (default), block sizes are planned to sum to an exact target length shared by combinations that should match — so site totals no longer drift (46 vs 48) from random overshoot. With `--no-equalize`, blocks are drawn until the minimum is met and totals may differ slightly. Site quotas/ratios set intentional unequal planned sizes by site. REDCap assigns the next unused matching row in list order.
 
 Open randomization writes group codes into the randomization column. Blinded randomization writes unique alphanumeric codes into the text field and, by default, adds `redcap_randomization_group` with the arm. Mapping CSVs remain an unblinded audit copy.
 

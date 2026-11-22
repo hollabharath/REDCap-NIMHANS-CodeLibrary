@@ -11,7 +11,10 @@ source(src, local = environment())
 
 `%||%` <- function(x, y) if (is.null(x) || (length(x) == 1 && is.na(x))) y else x
 
-APP_VERSION <- "1.0"
+APP_VERSION <- "1.1"
+
+# Fresh development seed each time the app process starts (not tied to calendar date).
+INITIAL_SEED <- as.integer(sample.int(1e8L - 1L, 1L))
 
 help_box <- function(...) {
   shiny::div(class = "help-box", shiny::HTML(paste(...)))
@@ -66,9 +69,16 @@ ui <- shiny::fluidPage(
       shiny::numericInput("n", "Target sample size (N)", value = 120, min = 1, step = 1),
       shiny::sliderInput("buffer_pct", "Extra assignments (drop-in / drop-out buffer)", min = 0, max = 100, value = 25, step = 5, post = "%"),
       shiny::textInput("block_sizes", "Block sizes (comma-separated)", value = "4,6,8"),
-      shiny::helpText("Each size must be a multiple of the allocation-ratio total (2 for 1:1, 3 for 2:1). Sequences are generated independently within each stratum × site combination."),
-      shiny::numericInput("seed", "Random seed (development table)", value = as.integer(Sys.Date()), min = 0, step = 1),
+      shiny::helpText("Each size must be a multiple of the allocation-ratio total (2 for 1:1, 3 for 2:1). With equalize on, every combination gets the same exact length."),
+      shiny::checkboxInput(
+        "equalize",
+        "Equalize lengths (exact common row count per combination; recommended)",
+        value = TRUE
+      ),
+      shiny::numericInput("seed", "Random seed (development table)", value = INITIAL_SEED, min = 0, step = 1),
+      shiny::helpText("Seed is chosen at random when the app starts; change it only if you need to reproduce a prior table."),
       shiny::numericInput("prod_seed", "Production seed (optional)", value = NA, min = 0, step = 1),
+      shiny::actionButton("reshuffle_seed", "New random seed", class = "btn-default btn-sm"),
       shiny::textInput("prefix", "Filename prefix (one per randomization model)", value = "RandomizationAllocationTemplate"),
       shiny::textInput("field", "C) Randomization field (REDCap variable)", value = "randomize"),
       shiny::radioButtons(
@@ -140,7 +150,7 @@ ui <- shiny::fluidPage(
       shiny::div(
         class = "step-card",
         shiny::h4("B) Randomize by group/site?"),
-        help_box("For multi-site studies, stratify by a site field <em>or</em> by Data Access Groups. For DAGs, enter <strong>numeric group IDs</strong> from the Step 2 template (not display names)."),
+        help_box("For multi-site studies, stratify by a site field <em>or</em> by Data Access Groups. For DAGs, enter <strong>numeric group IDs</strong> from the Step 2 template (not display names). With equalize on, sites share equal totals unless you set a quota or ratio below."),
         shiny::checkboxInput("use_site", "Stratify by group/site", value = FALSE),
         shiny::conditionalPanel(
           "input.use_site",
@@ -156,7 +166,27 @@ ui <- shiny::fluidPage(
             "input.site_mode == 'field'",
             shiny::textInput("site_field", "Group/site field (REDCap variable)", value = "site", placeholder = "site")
           ),
-          shiny::textInput("site_values", "Coded values (site field) or numeric DAG IDs", placeholder = "1,2,3")
+          shiny::textInput("site_values", "Coded values (site field) or numeric DAG IDs", placeholder = "1,2,3"),
+          shiny::radioButtons(
+            "site_alloc_mode",
+            "Site sample-size plan",
+            choices = c(
+              "Equal share of N (default)" = "equal",
+              "Unequal ratio weights" = "ratio",
+              "Fixed quota per site (before buffer)" = "quota"
+            ),
+            selected = "equal"
+          ),
+          shiny::conditionalPanel(
+            "input.site_alloc_mode == 'ratio'",
+            shiny::textInput("site_ratio", "Weights in site-code order", placeholder = "2,1,1"),
+            shiny::helpText("One positive integer per site code, same order as above.")
+          ),
+          shiny::conditionalPanel(
+            "input.site_alloc_mode == 'quota'",
+            shiny::textInput("site_quota", "Quota per site", placeholder = "1=40,2=30,3=30"),
+            shiny::helpText("Planned N before buffer. Buffer is applied on top.")
+          )
         )
       ),
       shiny::div(
@@ -208,6 +238,10 @@ ui <- shiny::fluidPage(
 
 server <- function(input, output, session) {
   result <- shiny::reactiveVal(NULL)
+
+  shiny::observeEvent(input$reshuffle_seed, {
+    shiny::updateNumericInput(session, "seed", value = as.integer(sample.int(1e8L - 1L, 1L)))
+  })
 
   output$arms_ui <- shiny::renderUI({
     n <- input$n_arms %||% 2
@@ -298,6 +332,20 @@ server <- function(input, output, session) {
     list(name = name, values = parse_csv_vals(input$site_values %||% ""))
   }
 
+  collect_site_quota <- function() {
+    if (!isTRUE(input$use_site) || !identical(input$site_alloc_mode, "quota")) {
+      return(NULL)
+    }
+    parse_quota_spec(input$site_quota %||% "")
+  }
+
+  collect_site_ratio <- function() {
+    if (!isTRUE(input$use_site) || !identical(input$site_alloc_mode, "ratio")) {
+      return(NULL)
+    }
+    parse_int_csv(input$site_ratio %||% "")
+  }
+
   shiny::observeEvent(input$generate, {
     arms <- collect_arms()
     labels <- if (all(!nzchar(arms$labels))) NULL else arms$labels
@@ -306,6 +354,20 @@ server <- function(input, output, session) {
       NULL
     })
     if (is.null(block_sizes)) {
+      return()
+    }
+    site_quota <- tryCatch(collect_site_quota(), error = function(e) {
+      shiny::showNotification(conditionMessage(e), type = "error")
+      "bad"
+    })
+    if (identical(site_quota, "bad")) {
+      return()
+    }
+    site_ratio <- tryCatch(collect_site_ratio(), error = function(e) {
+      shiny::showNotification(conditionMessage(e), type = "error")
+      "bad"
+    })
+    if (identical(site_ratio, "bad")) {
       return()
     }
     tryCatch({
@@ -329,7 +391,10 @@ server <- function(input, output, session) {
         code_length = as.integer(input$code_length %||% 3),
         exclude_ambiguous = isTRUE(input$exclude_ambiguous),
         include_group_col = isTRUE(input$include_group_col),
-        include_rand_number = isTRUE(input$include_rand_number)
+        include_rand_number = isTRUE(input$include_rand_number),
+        equalize = isTRUE(input$equalize),
+        site_quota = site_quota,
+        site_ratio = site_ratio
       )
       result(res)
       msg <- paste("Generated", nrow(res$dev), "rows for development and production.")
