@@ -60,15 +60,147 @@ parse_quota_spec <- function(x) {
   out <- numeric(0)
   for (part in parts) {
     if (!grepl("=", part, fixed = TRUE)) {
-      stop("Site quota must look like code=n, e.g. 1=40,2=30 (got: ", part, ")", call. = FALSE)
+      stop("Quota must look like code=n, e.g. 1=40,2=30 (got: ", part, ")", call. = FALSE)
     }
     kv <- strsplit(part, "=", fixed = TRUE)[[1]]
     name <- trim_chr(kv[[1]])
     val <- suppressWarnings(as.numeric(trim_chr(paste(kv[-1], collapse = "="))))
     if (!nzchar(name) || is.na(val) || val <= 0) {
-      stop("Site quota entries need a code and a positive number: ", part, call. = FALSE)
+      stop("Quota entries need a code and a positive number: ", part, call. = FALSE)
     }
     out[[name]] <- val
+  }
+  out
+}
+
+# "sex=2,1;age_gp=1,2" -> list(sex = c(2,1), age_gp = c(1,2)) aligned to strata codes
+parse_strata_ratio_spec <- function(x, strata) {
+  if (is_blank(x)) {
+    return(NULL)
+  }
+  if (length(strata) == 0) {
+    stop("strata_ratio requires stratum fields.", call. = FALSE)
+  }
+  # Allow bare "2,1" when there is a single stratum field
+  if (!grepl("=", as.character(x), fixed = TRUE) && length(strata) == 1) {
+    w <- parse_int_csv(x)
+    if (length(w) != length(strata[[1]]) || any(w < 1)) {
+      stop(
+        "strata_ratio needs ", length(strata[[1]]),
+        " positive integers matching codes ", paste(strata[[1]], collapse = ","),
+        call. = FALSE
+      )
+    }
+    names(w) <- as.character(strata[[1]])
+    out <- list(w)
+    names(out) <- names(strata)[1]
+    return(out)
+  }
+  raw <- parse_strata_spec(x)
+  out <- list()
+  for (nm in names(strata)) {
+    if (is.null(raw[[nm]])) {
+      stop("strata_ratio missing field: ", nm, call. = FALSE)
+    }
+    w <- suppressWarnings(as.integer(raw[[nm]]))
+    if (length(w) != length(strata[[nm]]) || any(is.na(w)) || any(w < 1)) {
+      stop(
+        "strata_ratio for ", nm, " needs ", length(strata[[nm]]),
+        " positive integers matching codes ", paste(strata[[nm]], collapse = ","),
+        call. = FALSE
+      )
+    }
+    names(w) <- as.character(strata[[nm]])
+    out[[nm]] <- w
+  }
+  extra <- setdiff(names(raw), names(strata))
+  if (length(extra)) {
+    stop("strata_ratio has unknown field(s): ", paste(extra, collapse = ", "), call. = FALSE)
+  }
+  out
+}
+
+# Single field: "1=40,2=60". Multi-field combo keys: "1|1=20,1|2=30,2|1=20,2|2=30"
+# (codes in stratum-field order, separated by |).
+parse_strata_quota_spec <- function(x, strata) {
+  if (is_blank(x)) {
+    return(NULL)
+  }
+  if (length(strata) == 0) {
+    stop("strata_quota requires stratum fields.", call. = FALSE)
+  }
+  if (length(strata) == 1) {
+    q <- parse_quota_spec(x)
+    codes <- as.character(strata[[1]])
+    missing <- setdiff(codes, names(q))
+    extra <- setdiff(names(q), codes)
+    if (length(missing) || length(extra)) {
+      stop(
+        "strata_quota must include every code for ", names(strata)[1],
+        " (", paste(codes, collapse = ","), ").",
+        call. = FALSE
+      )
+    }
+    return(q)
+  }
+  parts <- trim_chr(unlist(strsplit(as.character(x), ",", fixed = TRUE)))
+  parts <- parts[nzchar(parts)]
+  out <- numeric(0)
+  for (part in parts) {
+    if (!grepl("=", part, fixed = TRUE)) {
+      stop("Multi-field strata_quota entries look like 1|2=30 (got: ", part, ")", call. = FALSE)
+    }
+    kv <- strsplit(part, "=", fixed = TRUE)[[1]]
+    key <- trim_chr(kv[[1]])
+    val <- suppressWarnings(as.numeric(trim_chr(paste(kv[-1], collapse = "="))))
+    codes <- trim_chr(unlist(strsplit(key, "|", fixed = TRUE)))
+    if (length(codes) != length(strata) || is.na(val) || val <= 0) {
+      stop(
+        "strata_quota key must have ", length(strata),
+        " codes separated by | and a positive N: ", part,
+        call. = FALSE
+      )
+    }
+    out[[paste(codes, collapse = "|")]] <- val
+  }
+  grid <- factor_grid(strata)
+  needed <- apply(grid, 1, function(r) paste(as.character(r), collapse = "|"))
+  missing <- setdiff(needed, names(out))
+  if (length(missing)) {
+    stop("strata_quota missing combination(s): ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+  out
+}
+
+combo_strata_key <- function(row, strata_names) {
+  paste(as.character(unlist(row[strata_names])), collapse = "|")
+}
+
+# Relative weight for one stratum combination from per-field ratio weights.
+combo_strata_weight <- function(row, strata_ratio) {
+  w <- 1
+  for (nm in names(strata_ratio)) {
+    code <- as.character(row[[nm]])
+    w <- w * strata_ratio[[nm]][[code]]
+  }
+  w
+}
+
+allocate_by_weights <- function(total, weights) {
+  total <- as.integer(total)
+  weights <- as.numeric(weights)
+  if (length(weights) == 0) {
+    return(integer(0))
+  }
+  if (sum(weights) <= 0) {
+    stop("Weights must sum to a positive number.", call. = FALSE)
+  }
+  raw <- total * weights / sum(weights)
+  out <- as.integer(floor(raw))
+  rem <- as.integer(total - sum(out))
+  if (rem > 0) {
+    frac_order <- order(raw - out, decreasing = TRUE)
+    out[frac_order[seq_len(rem)]] <- out[frac_order[seq_len(rem)]] + 1L
   }
   out
 }
@@ -275,6 +407,17 @@ validate_params <- function(p) {
   if (!is.null(p$n_per_stratum) && (!is.null(p$site_quota) || !is.null(p$site_ratio))) {
     errs <- c(errs, "Do not combine n_per_stratum with site_quota / site_ratio.")
   }
+  if (!is.null(p$strata_quota) && !is.null(p$strata_ratio)) {
+    errs <- c(errs, "Use either strata_quota or strata_ratio, not both.")
+  }
+  if (!is.null(p$strata_quota) || !is.null(p$strata_ratio)) {
+    if (length(p$strata) == 0) {
+      errs <- c(errs, "strata_quota / strata_ratio require stratum fields.")
+    }
+  }
+  if (!is.null(p$n_per_stratum) && (!is.null(p$strata_quota) || !is.null(p$strata_ratio))) {
+    errs <- c(errs, "Do not combine n_per_stratum with strata_quota / strata_ratio.")
+  }
   if (!is.null(p$seed) && (is.na(p$seed) || p$seed < 0)) {
     errs <- c(errs, "Seed must be a non-negative integer.")
   }
@@ -394,59 +537,126 @@ generate_stratum_sequence_exact <- function(n_target, arms, ratio, block_sizes) 
   unlist(lapply(plan, function(bs) generate_block(arms, ratio, bs)), use.names = FALSE)
 }
 
-# Per-combination row targets (before/at exact length).
+has_site_plan <- function(p) {
+  !is.null(p$site) && (!is.null(p$site_quota) || !is.null(p$site_ratio))
+}
+
+has_strata_plan <- function(p) {
+  length(p$strata) > 0 && (!is.null(p$strata_quota) || !is.null(p$strata_ratio))
+}
+
+# Split a budget across rows of a stratum-only grid using equal / ratio / quota.
+allocate_strata_budget <- function(budget, strata_grid, p) {
+  n <- nrow(strata_grid)
+  if (n == 0) {
+    return(integer(0))
+  }
+  if (n == 1) {
+    return(as.integer(budget))
+  }
+  strata_names <- names(p$strata)
+  if (!is.null(p$strata_quota)) {
+    if (length(p$strata) == 1) {
+      q <- vapply(seq_len(n), function(i) {
+        code <- as.character(strata_grid[i, 1])
+        as.numeric(p$strata_quota[[code]])
+      }, numeric(1))
+    } else {
+      q <- vapply(seq_len(n), function(i) {
+        key <- combo_strata_key(strata_grid[i, , drop = FALSE], strata_names)
+        as.numeric(p$strata_quota[[key]])
+      }, numeric(1))
+    }
+    # Quotas are planned N before buffer; scale to this budget while keeping proportions.
+    return(allocate_by_weights(budget, q))
+  }
+  if (!is.null(p$strata_ratio)) {
+    w <- vapply(seq_len(n), function(i) {
+      combo_strata_weight(strata_grid[i, , drop = FALSE], p$strata_ratio)
+    }, numeric(1))
+    return(allocate_by_weights(budget, w))
+  }
+  # Equal split
+  base <- as.integer(budget %/% n)
+  rem <- as.integer(budget - base * n)
+  out <- rep(base, n)
+  if (rem > 0) {
+    out[seq_len(rem)] <- out[seq_len(rem)] + 1L
+  }
+  out
+}
+
+# Per-combination row targets (exact length when equalize = TRUE).
 compute_combo_targets <- function(p, grid) {
   n_combos <- if (is.null(grid)) 1L else nrow(grid)
-  target_total <- ceiling(p$n * (1 + p$buffer))
+  target_total <- as.integer(ceiling(p$n * (1 + p$buffer)))
 
   if (!is.null(p$n_per_stratum)) {
     targets <- rep(as.integer(p$n_per_stratum), n_combos)
-  } else if (!is.null(p$site) && (!is.null(p$site_quota) || !is.null(p$site_ratio))) {
+  } else if (is.null(grid)) {
+    targets <- target_total
+  } else if (!is.null(p$site) && p$site$name %in% names(grid)) {
     site_name <- p$site$name
     site_vals <- as.character(p$site$values)
-    if (!is.null(p$site_quota)) {
-      budgets <- vapply(site_vals, function(v) {
-        q <- p$site_quota[[v]]
-        if (is.null(q) || is.na(q)) {
-          stop("Site quota missing for code: ", v, call. = FALSE)
-        }
-        as.integer(ceiling(q * (1 + p$buffer)))
-      }, integer(1))
+    strata_names <- names(p$strata)
+    strata_grid <- if (length(p$strata) == 0) {
+      NULL
     } else {
-      w <- as.numeric(p$site_ratio)
-      budgets <- as.integer(round(target_total * w / sum(w)))
-      drift <- target_total - sum(budgets)
-      if (drift != 0) {
-        budgets[1] <- budgets[1] + drift
+      factor_grid(p$strata)
+    }
+    if (!is.null(p$site_quota)) {
+      site_budgets <- vapply(site_vals, function(v) {
+        as.integer(ceiling(p$site_quota[[v]] * (1 + p$buffer)))
+      }, integer(1))
+    } else if (!is.null(p$site_ratio)) {
+      site_budgets <- allocate_by_weights(target_total, as.numeric(p$site_ratio))
+    } else {
+      site_budgets <- allocate_by_weights(target_total, rep(1, length(site_vals)))
+    }
+    names(site_budgets) <- site_vals
+
+    targets <- integer(n_combos)
+    sg_keys <- if (is.null(strata_grid)) {
+      character(0)
+    } else {
+      apply(strata_grid, 1, function(r) paste(as.character(r), collapse = "|"))
+    }
+    for (sv in site_vals) {
+      idx <- which(as.character(grid[[site_name]]) == sv)
+      if (is.null(strata_grid)) {
+        targets[idx] <- site_budgets[[sv]]
+      } else {
+        within <- allocate_strata_budget(site_budgets[[sv]], strata_grid, p)
+        for (i in idx) {
+          key <- combo_strata_key(grid[i, , drop = FALSE], strata_names)
+          targets[i] <- within[[match(key, sg_keys)]]
+        }
       }
     }
-    names(budgets) <- site_vals
-    n_within <- if (length(p$strata) == 0) 1L else nrow(factor_grid(p$strata))
-    targets <- integer(n_combos)
-    for (i in seq_len(n_combos)) {
-      sv <- as.character(grid[i, site_name])
-      targets[i] <- as.integer(ceiling(budgets[[sv]] / n_within))
-    }
+  } else if (!is.null(p$strata_quota)) {
+    # Absolute stratum quotas (before buffer), no site
+    strata_names <- names(p$strata)
+    targets <- vapply(seq_len(n_combos), function(i) {
+      key <- if (length(p$strata) == 1) {
+        as.character(grid[i, 1])
+      } else {
+        combo_strata_key(grid[i, , drop = FALSE], strata_names)
+      }
+      as.integer(ceiling(p$strata_quota[[key]] * (1 + p$buffer)))
+    }, integer(1))
   } else {
-    targets <- rep(as.integer(ceiling(target_total / n_combos)), n_combos)
+    # Strata only: equal or ratio weights of N(+buffer)
+    targets <- allocate_strata_budget(target_total, grid, p)
   }
 
-  if (isTRUE(p$equalize) && n_combos > 1L && !is.null(grid) && !is.null(p$site) &&
-      (!is.null(p$site_quota) || !is.null(p$site_ratio))) {
-    site_name <- p$site$name
-    for (sv in unique(as.character(grid[[site_name]]))) {
-      idx <- which(as.character(grid[[site_name]]) == sv)
-      targets[idx] <- max(targets[idx])
-    }
-  } else if (isTRUE(p$equalize) && n_combos > 1L) {
-    targets <- rep(max(targets), n_combos)
-  }
-
+  # equalize = exact achievable lengths. Force a shared length only when the plan is equal.
+  unequal_plan <- has_site_plan(p) || has_strata_plan(p)
   if (isTRUE(p$equalize)) {
-    targets <- vapply(targets, function(t) round_up_achievable(t, p$block_sizes), integer(1))
-    if (is.null(p$site) || (is.null(p$site_quota) && is.null(p$site_ratio))) {
-      targets <- rep(max(targets), length(targets))
-    } else if (!is.null(grid)) {
+    targets <- vapply(targets, function(t) round_up_achievable(max(1L, t), p$block_sizes), integer(1))
+    if (!unequal_plan && n_combos > 1L) {
+      targets <- rep(max(targets), n_combos)
+    } else if (has_site_plan(p) && !has_strata_plan(p) && !is.null(grid) && !is.null(p$site)) {
+      # Unequal sites, equal strata within site → same length within each site
       site_name <- p$site$name
       for (sv in unique(as.character(grid[[site_name]]))) {
         idx <- which(as.character(grid[[site_name]]) == sv)
@@ -548,7 +758,9 @@ normalize_params <- function(
     include_rand_number = FALSE,
     equalize = TRUE,
     site_quota = NULL,
-    site_ratio = NULL) {
+    site_ratio = NULL,
+    strata_quota = NULL,
+    strata_ratio = NULL) {
   field <- trim_chr(field)
   arms <- trim_chr(arms)
   type <- match.arg(type, c("open", "blinded"))
@@ -574,9 +786,6 @@ normalize_params <- function(
   } else {
     seed_prod <- as.integer(prod_seed)
   }
-  if (is.character(site_quota) || (is.list(site_quota) && !is.null(names(site_quota)))) {
-    # already named numeric from parse_quota_spec, or character to parse
-  }
   if (is.character(site_quota) && length(site_quota) == 1) {
     site_quota <- parse_quota_spec(site_quota)
   }
@@ -586,6 +795,12 @@ normalize_params <- function(
   }
   if (!is.null(site_ratio)) {
     site_ratio <- as.integer(site_ratio)
+  }
+  if (is.character(strata_quota) && length(strata_quota) == 1) {
+    strata_quota <- parse_strata_quota_spec(strata_quota, strata)
+  }
+  if (is.character(strata_ratio) && length(strata_ratio) == 1) {
+    strata_ratio <- parse_strata_ratio_spec(strata_ratio, strata)
   }
   list(
     n = as.integer(n),
@@ -612,7 +827,9 @@ normalize_params <- function(
     include_rand_number = isTRUE(include_rand_number) && type == "open",
     equalize = isTRUE(equalize),
     site_quota = site_quota,
-    site_ratio = site_ratio
+    site_ratio = site_ratio,
+    strata_quota = strata_quota,
+    strata_ratio = strata_ratio
   )
 }
 
@@ -764,9 +981,13 @@ build_log <- function(p, dev, prod, n_combos, combo_targets, warnings = characte
     paste("  Target N:             ", p$n),
     paste("  Buffer:               ", paste0(round(100 * p$buffer), "%")),
     paste("  Equalize lengths:     ", if (isTRUE(p$equalize)) {
-      "yes (exact common length per combination; no random overshoot)"
+      if (has_site_plan(p) || has_strata_plan(p)) {
+        "yes (exact lengths; unequal site/strata plans kept as planned)"
+      } else {
+        "yes (exact common length per combination; no random overshoot)"
+      }
     } else {
-      "no (variable overshoot — site totals may differ by a few rows)"
+      "no (variable overshoot — combination totals may differ by a few rows)"
     }),
     paste("  Rows per combination: ", paste(unique(combo_targets), collapse = " / ")),
     paste("  Combinations:         ", n_combos),
@@ -784,6 +1005,19 @@ build_log <- function(p, dev, prod, n_combos, combo_targets, warnings = characte
       "  Site ratio weights:    ",
       paste(sprintf("%s=%s", p$site$values, p$site_ratio), collapse = ", ")
     ))
+  }
+  if (!is.null(p$strata_quota)) {
+    lines <- c(lines, paste(
+      "  Strata quotas (pre-buffer):",
+      paste(sprintf("%s=%s", names(p$strata_quota), p$strata_quota), collapse = ", ")
+    ))
+  }
+  if (!is.null(p$strata_ratio)) {
+    ratio_bits <- vapply(names(p$strata_ratio), function(nm) {
+      w <- p$strata_ratio[[nm]]
+      paste0(nm, "=", paste(sprintf("%s:%s", names(w), w), collapse = "/"))
+    }, character(1))
+    lines <- c(lines, paste("  Strata ratio weights:  ", paste(ratio_bits, collapse = "; ")))
   }
   if (identical(p$type, "blinded")) {
     lines <- c(

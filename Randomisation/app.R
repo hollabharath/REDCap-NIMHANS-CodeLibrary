@@ -11,7 +11,7 @@ source(src, local = environment())
 
 `%||%` <- function(x, y) if (is.null(x) || (length(x) == 1 && is.na(x))) y else x
 
-APP_VERSION <- "1.1"
+APP_VERSION <- "1.3"
 
 # Fresh development seed each time the app process starts (not tied to calendar date).
 INITIAL_SEED <- as.integer(sample.int(1e8L - 1L, 1L))
@@ -139,12 +139,32 @@ ui <- shiny::fluidPage(
       shiny::div(
         class = "step-card",
         shiny::h4("A) Use stratified randomization?"),
-        help_box("Choose the same multiple-choice fields and coded values as in REDCap Setup Step 1A (for example sex, age group). Balance is enforced <em>within</em> each combination of codes."),
-        shiny::checkboxInput("use_strata", "Stratify by one or more fields", value = TRUE),
+        help_box("Choose the same multiple-choice fields and coded values as in REDCap Setup Step 1A (for example sex, age group). Balance is enforced <em>within</em> each combination of codes. With equalize on, combinations share equal lengths unless you set a strata quota or ratio below."),
+        shiny::checkboxInput("use_strata", "Stratify by one or more fields", value = FALSE),
         shiny::conditionalPanel(
           "input.use_strata",
           shiny::numericInput("n_strata", "Number of strata fields (REDCap max 14)", value = 2, min = 1, max = 14, step = 1),
-          shiny::uiOutput("strata_ui")
+          shiny::uiOutput("strata_ui"),
+          shiny::radioButtons(
+            "strata_alloc_mode",
+            "Strata sample-size plan",
+            choices = c(
+              "Equal share of N (default)" = "equal",
+              "Unequal ratio weights" = "ratio",
+              "Fixed quota per combination (before buffer)" = "quota"
+            ),
+            selected = "equal"
+          ),
+          shiny::conditionalPanel(
+            "input.strata_alloc_mode == 'ratio'",
+            shiny::helpText("Enter a weight for each coded value. With multiple fields, combination weight = product of the field weights."),
+            shiny::uiOutput("strata_ratio_ui")
+          ),
+          shiny::conditionalPanel(
+            "input.strata_alloc_mode == 'quota'",
+            shiny::helpText("One planned N (before buffer) per stratum combination."),
+            shiny::uiOutput("strata_quota_ui")
+          )
         )
       ),
       shiny::div(
@@ -179,13 +199,13 @@ ui <- shiny::fluidPage(
           ),
           shiny::conditionalPanel(
             "input.site_alloc_mode == 'ratio'",
-            shiny::textInput("site_ratio", "Weights in site-code order", placeholder = "2,1,1"),
-            shiny::helpText("One positive integer per site code, same order as above.")
+            shiny::helpText("One weight per site code."),
+            shiny::uiOutput("site_ratio_ui")
           ),
           shiny::conditionalPanel(
             "input.site_alloc_mode == 'quota'",
-            shiny::textInput("site_quota", "Quota per site", placeholder = "1=40,2=30,3=30"),
-            shiny::helpText("Planned N before buffer. Buffer is applied on top.")
+            shiny::helpText("Planned N before buffer for each site. Buffer is applied on top."),
+            shiny::uiOutput("site_quota_ui")
           )
         )
       ),
@@ -270,27 +290,172 @@ server <- function(input, output, session) {
 
   output$strata_ui <- shiny::renderUI({
     n <- input$n_strata %||% 1
-    defaults_name <- c("sex", "age_gp")
-    defaults_codes <- c("1,2", "1,2")
     lapply(seq_len(n), function(i) {
       shiny::fluidRow(
         shiny::column(6, shiny::textInput(
           paste0("stratum_name_", i),
           if (i == 1) "REDCap variable" else NULL,
-          value = shiny::isolate({
-            existing <- input[[paste0("stratum_name_", i)]]
-            if (!is.null(existing)) existing else if (i <= length(defaults_name)) defaults_name[[i]] else ""
-          }),
+          value = shiny::isolate(input[[paste0("stratum_name_", i)]] %||% ""),
           placeholder = "sex"
         )),
         shiny::column(6, shiny::textInput(
           paste0("stratum_codes_", i),
           if (i == 1) "Coded values (comma-separated)" else NULL,
-          value = shiny::isolate({
-            existing <- input[[paste0("stratum_codes_", i)]]
-            if (!is.null(existing)) existing else if (i <= length(defaults_codes)) defaults_codes[[i]] else ""
-          }),
+          value = shiny::isolate(input[[paste0("stratum_codes_", i)]] %||% ""),
           placeholder = "1,2"
+        ))
+      )
+    })
+  })
+
+  # Live strata list from the A) field rows (same source as generate).
+  current_strata <- shiny::reactive({
+    if (!isTRUE(input$use_strata)) {
+      return(list())
+    }
+    n <- input$n_strata %||% 0
+    out <- list()
+    for (i in seq_len(n)) {
+      nm <- trim_chr(input[[paste0("stratum_name_", i)]] %||% "")
+      codes <- parse_csv_vals(input[[paste0("stratum_codes_", i)]] %||% "")
+      if (nzchar(nm) && length(codes) > 0) {
+        out[[nm]] <- codes
+      }
+    }
+    out
+  })
+
+  current_site_codes <- shiny::reactive({
+    if (!isTRUE(input$use_site)) {
+      return(character(0))
+    }
+    parse_csv_vals(input$site_values %||% "")
+  })
+
+  output$strata_ratio_ui <- shiny::renderUI({
+    strata <- current_strata()
+    if (length(strata) == 0) {
+      return(shiny::helpText("Add stratum fields and coded values above first."))
+    }
+    blocks <- lapply(seq_along(strata), function(fi) {
+      nm <- names(strata)[[fi]]
+      codes <- strata[[fi]]
+      header <- shiny::fluidRow(
+        shiny::column(4, shiny::tags$strong(paste0(nm, " code"))),
+        shiny::column(4, shiny::tags$strong("Weight"))
+      )
+      rows <- lapply(seq_along(codes), function(ci) {
+        id <- paste0("strata_w_", fi, "_", ci)
+        shiny::fluidRow(
+          shiny::column(4, shiny::tags$div(style = "padding-top: 8px;", codes[[ci]])),
+          shiny::column(4, shiny::numericInput(
+            id,
+            NULL,
+            value = shiny::isolate(input[[id]] %||% 1),
+            min = 1,
+            step = 1
+          ))
+        )
+      })
+      shiny::tagList(header, rows, shiny::br())
+    })
+    shiny::tagList(blocks)
+  })
+
+  output$strata_quota_ui <- shiny::renderUI({
+    strata <- current_strata()
+    if (length(strata) == 0) {
+      return(shiny::helpText("Add stratum fields and coded values above first."))
+    }
+    grid <- factor_grid(strata)
+    n_combos <- nrow(grid)
+    if (n_combos > 64) {
+      return(shiny::div(
+        class = "warn-box",
+        paste0(
+          "Too many combinations (", n_combos,
+          ") for the row editor. Reduce coded values, or use the CLI --strata-quota option."
+        )
+      ))
+    }
+    field_names <- names(strata)
+    n_fields <- length(field_names)
+    # Header
+    header_cols <- lapply(seq_len(n_fields), function(j) {
+      shiny::column(max(2, min(3, floor(8 / n_fields))), shiny::tags$strong(field_names[[j]]))
+    })
+    header <- do.call(
+      shiny::fluidRow,
+      c(header_cols, list(shiny::column(4, shiny::tags$strong("Planned N"))))
+    )
+    equal_share <- max(1L, as.integer(round((input$n %||% 100) / n_combos)))
+    rows <- lapply(seq_len(n_combos), function(i) {
+      id <- paste0("strata_q_", i)
+      code_cols <- lapply(seq_len(n_fields), function(j) {
+        shiny::column(
+          max(2, min(3, floor(8 / n_fields))),
+          shiny::tags$div(
+            style = "padding-top: 8px;",
+            as.character(grid[i, j])
+          )
+        )
+      })
+      do.call(
+        shiny::fluidRow,
+        c(
+          code_cols,
+          list(shiny::column(
+            4,
+            shiny::numericInput(
+              id,
+              NULL,
+              value = shiny::isolate(input[[id]] %||% equal_share),
+              min = 1,
+              step = 1
+            )
+          ))
+        )
+      )
+    })
+    shiny::tagList(header, rows)
+  })
+
+  output$site_ratio_ui <- shiny::renderUI({
+    codes <- current_site_codes()
+    if (length(codes) == 0) {
+      return(shiny::helpText("Enter site / DAG coded values above first."))
+    }
+    lapply(seq_along(codes), function(i) {
+      id <- paste0("site_w_", i)
+      shiny::fluidRow(
+        shiny::column(4, shiny::tags$div(style = "padding-top: 8px;", paste("Code", codes[[i]]))),
+        shiny::column(4, shiny::numericInput(
+          id,
+          if (i == 1) "Weight" else NULL,
+          value = shiny::isolate(input[[id]] %||% 1),
+          min = 1,
+          step = 1
+        ))
+      )
+    })
+  })
+
+  output$site_quota_ui <- shiny::renderUI({
+    codes <- current_site_codes()
+    if (length(codes) == 0) {
+      return(shiny::helpText("Enter site / DAG coded values above first."))
+    }
+    equal_share <- max(1L, as.integer(round((input$n %||% 100) / length(codes))))
+    lapply(seq_along(codes), function(i) {
+      id <- paste0("site_q_", i)
+      shiny::fluidRow(
+        shiny::column(4, shiny::tags$div(style = "padding-top: 8px;", paste("Code", codes[[i]]))),
+        shiny::column(4, shiny::numericInput(
+          id,
+          if (i == 1) "Planned N" else NULL,
+          value = shiny::isolate(input[[id]] %||% equal_share),
+          min = 1,
+          step = 1
         ))
       )
     })
@@ -336,14 +501,89 @@ server <- function(input, output, session) {
     if (!isTRUE(input$use_site) || !identical(input$site_alloc_mode, "quota")) {
       return(NULL)
     }
-    parse_quota_spec(input$site_quota %||% "")
+    codes <- current_site_codes()
+    if (length(codes) == 0) {
+      stop("Enter site / DAG coded values before setting quotas.", call. = FALSE)
+    }
+    q <- vapply(seq_along(codes), function(i) {
+      val <- as.numeric(input[[paste0("site_q_", i)]] %||% NA_real_)
+      if (is.na(val) || val <= 0) {
+        stop("Each site quota must be a positive number (code ", codes[[i]], ").", call. = FALSE)
+      }
+      val
+    }, numeric(1))
+    names(q) <- codes
+    q
   }
 
   collect_site_ratio <- function() {
     if (!isTRUE(input$use_site) || !identical(input$site_alloc_mode, "ratio")) {
       return(NULL)
     }
-    parse_int_csv(input$site_ratio %||% "")
+    codes <- current_site_codes()
+    if (length(codes) == 0) {
+      stop("Enter site / DAG coded values before setting weights.", call. = FALSE)
+    }
+    w <- vapply(seq_along(codes), function(i) {
+      val <- as.integer(input[[paste0("site_w_", i)]] %||% NA_integer_)
+      if (is.na(val) || val < 1) {
+        stop("Each site weight must be a positive integer (code ", codes[[i]], ").", call. = FALSE)
+      }
+      val
+    }, integer(1))
+    names(w) <- codes
+    w
+  }
+
+  collect_strata_quota <- function(strata) {
+    if (!isTRUE(input$use_strata) || !identical(input$strata_alloc_mode, "quota")) {
+      return(NULL)
+    }
+    if (length(strata) == 0) {
+      stop("Add stratum fields before setting quotas.", call. = FALSE)
+    }
+    grid <- factor_grid(strata)
+    if (nrow(grid) > 64) {
+      stop("Too many stratum combinations for the row editor; use CLI --strata-quota.", call. = FALSE)
+    }
+    q <- numeric(0)
+    for (i in seq_len(nrow(grid))) {
+      val <- as.numeric(input[[paste0("strata_q_", i)]] %||% NA_real_)
+      if (is.na(val) || val <= 0) {
+        stop("Each stratum quota must be a positive number (row ", i, ").", call. = FALSE)
+      }
+      key <- if (length(strata) == 1) {
+        as.character(grid[i, 1])
+      } else {
+        paste(as.character(unlist(grid[i, , drop = TRUE])), collapse = "|")
+      }
+      q[[key]] <- val
+    }
+    q
+  }
+
+  collect_strata_ratio <- function(strata) {
+    if (!isTRUE(input$use_strata) || !identical(input$strata_alloc_mode, "ratio")) {
+      return(NULL)
+    }
+    if (length(strata) == 0) {
+      stop("Add stratum fields before setting weights.", call. = FALSE)
+    }
+    out <- list()
+    for (fi in seq_along(strata)) {
+      nm <- names(strata)[[fi]]
+      codes <- strata[[fi]]
+      w <- vapply(seq_along(codes), function(ci) {
+        val <- as.integer(input[[paste0("strata_w_", fi, "_", ci)]] %||% NA_integer_)
+        if (is.na(val) || val < 1) {
+          stop("Each strata weight must be a positive integer (", nm, "=", codes[[ci]], ").", call. = FALSE)
+        }
+        val
+      }, integer(1))
+      names(w) <- as.character(codes)
+      out[[nm]] <- w
+    }
+    out
   }
 
   shiny::observeEvent(input$generate, {
@@ -370,13 +610,28 @@ server <- function(input, output, session) {
     if (identical(site_ratio, "bad")) {
       return()
     }
+    strata <- collect_strata()
+    strata_quota <- tryCatch(collect_strata_quota(strata), error = function(e) {
+      shiny::showNotification(conditionMessage(e), type = "error")
+      "bad"
+    })
+    if (identical(strata_quota, "bad")) {
+      return()
+    }
+    strata_ratio <- tryCatch(collect_strata_ratio(strata), error = function(e) {
+      shiny::showNotification(conditionMessage(e), type = "error")
+      "bad"
+    })
+    if (identical(strata_ratio, "bad")) {
+      return()
+    }
     tryCatch({
       res <- generate_allocation_tables(
         n = as.integer(input$n),
         field = input$field,
         arms = arms$codes,
         ratio = arms$ratios,
-        strata = collect_strata(),
+        strata = strata,
         site = collect_site(),
         block_sizes = block_sizes,
         buffer = (input$buffer_pct %||% 25) / 100,
@@ -394,7 +649,9 @@ server <- function(input, output, session) {
         include_rand_number = isTRUE(input$include_rand_number),
         equalize = isTRUE(input$equalize),
         site_quota = site_quota,
-        site_ratio = site_ratio
+        site_ratio = site_ratio,
+        strata_quota = strata_quota,
+        strata_ratio = strata_ratio
       )
       result(res)
       msg <- paste("Generated", nrow(res$dev), "rows for development and production.")

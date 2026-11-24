@@ -46,6 +46,8 @@ Options:
   --no-equalize       Allow variable block overshoot (site totals may differ)
   --site-quota        Planned N per site before buffer, e.g. 1=40,2=30,3=30
   --site-ratio        Weights matching site code order, e.g. 2,1,1
+  --strata-quota      Planned N per stratum (or combo): 1=40,2=60 or 1|1=20,1|2=30
+  --strata-ratio      Weights per stratum field: 2,1 or sex=2,1;age_gp=1,1
   --field             Randomization field / REDCap variable (default: randomize)
   --type              open (default) or blinded
   --arms              Comma-separated allocation codes (default: 1,2)
@@ -95,6 +97,8 @@ parse_cli <- function(args) {
     no_equalize = FALSE,
     site_quota = NULL,
     site_ratio = NULL,
+    strata_quota = NULL,
+    strata_ratio = NULL,
     field = "randomize",
     type = "open",
     arms = "1,2",
@@ -191,6 +195,12 @@ coerce_cli <- function(opt) {
   } else {
     opt$site_ratio <- NULL
   }
+  if (is_blank(opt$strata_quota)) {
+    opt$strata_quota <- NULL
+  }
+  if (is_blank(opt$strata_ratio)) {
+    opt$strata_ratio <- NULL
+  }
   if (!is.null(opt$seed) && !is_blank(opt$seed)) {
     opt$seed <- as.integer(opt$seed)
   } else {
@@ -218,6 +228,15 @@ coerce_cli <- function(opt) {
   site <- NULL
   if (!is.null(opt$site_quota) && !is.null(opt$site_ratio)) {
     cli_error("Use either --site-quota or --site-ratio, not both.")
+  }
+  if (!is.null(opt$strata_quota) && !is.null(opt$strata_ratio)) {
+    cli_error("Use either --strata-quota or --strata-ratio, not both.")
+  }
+  if (!is.null(opt$strata_quota)) {
+    opt$strata_quota <- parse_strata_quota_spec(opt$strata_quota, opt$strata)
+  }
+  if (!is.null(opt$strata_ratio)) {
+    opt$strata_ratio <- parse_strata_ratio_spec(opt$strata_ratio, opt$strata)
   }
   if (!is_blank(opt$site) && !is_blank(opt$dag)) {
     cli_error("Use either --site or --dag, not both.")
@@ -283,7 +302,9 @@ main <- function(args = commandArgs(trailingOnly = TRUE)) {
     include_rand_number = isTRUE(opt$include_rand_number),
     equalize = isTRUE(opt$equalize),
     site_quota = opt$site_quota,
-    site_ratio = opt$site_ratio
+    site_ratio = opt$site_ratio,
+    strata_quota = opt$strata_quota,
+    strata_ratio = opt$strata_ratio
   )
   if (length(result$warnings)) {
     cat("\nWarnings:\n")

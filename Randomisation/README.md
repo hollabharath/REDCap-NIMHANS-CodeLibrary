@@ -16,7 +16,7 @@ These tools follow guidance from the [Seattle Children's REDCap randomization he
 - Open randomization can optionally include `redcap_randomization_number` for the `[rand-number]` smart variable.
 - Strata explosion warnings, DAG ID validation, role/blinding notes in the generation log.
 - A 25% buffer is added by default so drop-ins do not exhaust the list.
-- **Equalize lengths** (default): every stratum × site combination gets the same exact row count (no random 46 vs 48 overshoot). Optional **site quotas** or **site ratio weights** for unequal planned enrollment by site.
+- **Equalize lengths** (default): combinations that should match get the same exact row count. Optional **site** and **strata** quotas or ratio weights for unequal planned enrollment (equalize then keeps those unequal targets exact, without flattening them).
 
 Setup Step 4 (automatic triggering when logic becomes true) is configured in REDCap, not in these files. If you use strata, those fields must already be saved before auto-randomization can run.
 
@@ -41,7 +41,7 @@ install.packages("shiny")   # once
 shiny::runApp("Randomisation")
 ```
 
-Fill in the randomization field name, allocation type (open vs blinded), group codes, optional strata, and optional site/DAG values using the **same variable names and coded values** as the template downloaded from Setup Step 2. Generate, inspect the balance log, then download the CSVs.
+Fill in the randomization field name, allocation type (open vs blinded), group codes, optional strata, and optional site/DAG values using the **same variable names and coded values** as the template downloaded from Setup Step 2. Unequal strata or site plans use the same style of per-code / per-combination rows as Allocation groups (CLI still uses compact `--strata-ratio` / `--strata-quota` strings). Generate, inspect the balance log, then download the CSVs.
 
 #### Command line
 
@@ -98,6 +98,22 @@ Rscript REDCap_Randomize.R \
   --site-ratio 2,1,1 \
   --outdir ./output
 
+# Unequal strata weights (single field: code order; multi-field: product of weights)
+Rscript REDCap_Randomize.R \
+  --n 120 \
+  --field randomize \
+  --strata "sex=1,2;age_gp=1,2" \
+  --strata-ratio "sex=2,1;age_gp=1,1" \
+  --outdir ./output
+
+# Fixed strata quotas (before buffer); multi-field keys use code1|code2
+Rscript REDCap_Randomize.R \
+  --n 100 \
+  --field randomize \
+  --strata "sex=1,2" \
+  --strata-quota "1=40,2=60" \
+  --outdir ./output
+
 # Second randomization model in the same project (platform / SMART trial)
 Rscript REDCap_Randomize.R \
   --n 80 \
@@ -122,6 +138,8 @@ Rscript REDCap_Randomize.R --help
 | `--equalize` / `--no-equalize` | Exact equal lengths per combination (default on) |
 | `--site-quota` | Planned N per site before buffer, e.g. `1=40,2=30` |
 | `--site-ratio` | Weights in site-code order, e.g. `2,1,1` |
+| `--strata-quota` | Planned N per stratum/combo, e.g. `1=40,2=60` or `1|1=20,1|2=30` |
+| `--strata-ratio` | Weights per field, e.g. `2,1` or `sex=2,1;age_gp=1,1` |
 | `--block-sizes` | Multiples of the ratio total; default `4,6,8` for 1:1 |
 | `--include-rand-number` | Open only: add `redcap_randomization_number` column |
 | `--code-style` / `--code-length` | Concealed code style (blinded mode) |
@@ -146,7 +164,7 @@ Rscript REDCap_Randomize.R --help
 
 #### Method
 
-For every combination of stratum codes (and group/site if used), the generator builds a permuted-block sequence. With **equalize** (default), block sizes are planned to sum to an exact target length shared by combinations that should match — so site totals no longer drift (46 vs 48) from random overshoot. With `--no-equalize`, blocks are drawn until the minimum is met and totals may differ slightly. Site quotas/ratios set intentional unequal planned sizes by site. REDCap assigns the next unused matching row in list order.
+For every combination of stratum codes (and group/site if used), the generator builds a permuted-block sequence. With **equalize** (default), block sizes are planned to sum to an exact target length for each combination; equal plans share one common length, while site/strata quotas or ratios keep intentional unequal lengths. With `--no-equalize`, blocks are drawn until the minimum is met and totals may differ slightly. REDCap assigns the next unused matching row in list order.
 
 Open randomization writes group codes into the randomization column. Blinded randomization writes unique alphanumeric codes into the text field and, by default, adds `redcap_randomization_group` with the arm. Mapping CSVs remain an unblinded audit copy.
 
