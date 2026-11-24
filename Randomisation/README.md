@@ -138,8 +138,8 @@ Rscript REDCap_Randomize.R --help
 | `--equalize` / `--no-equalize` | Exact equal lengths per combination (default on) |
 | `--site-quota` | Planned N per site before buffer, e.g. `1=40,2=30` |
 | `--site-ratio` | Weights in site-code order, e.g. `2,1,1` |
-| `--strata-quota` | Planned N per stratum/combo, e.g. `1=40,2=60` or `1|1=20,1|2=30` |
-| `--strata-ratio` | Weights per field, e.g. `2,1` or `sex=2,1;age_gp=1,1` |
+| `--strata-quota` | Planned N per stratum/combo, e.g. `1=40,2=60` or `1|1=20,1|2=30` (not with `--site`/`--dag`) |
+| `--strata-ratio` | Weights per field, e.g. `2,1` or `sex=2,1;age_gp=1,1` (ok with site budgets) |
 | `--block-sizes` | Multiples of the ratio total; default `4,6,8` for 1:1 |
 | `--include-rand-number` | Open only: add `redcap_randomization_number` column |
 | `--code-style` / `--code-length` | Concealed code style (blinded mode) |

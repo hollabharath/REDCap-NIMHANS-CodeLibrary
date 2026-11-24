@@ -251,6 +251,12 @@ coerce_cli <- function(opt) {
   if (!is_blank(opt$dag)) {
     site <- list(name = "redcap_data_access_group", values = parse_csv_vals(opt$dag))
   }
+  if (!is.null(opt$strata_quota) && !is.null(site)) {
+    cli_error(
+      "Do not combine --strata-quota with --site/--dag. ",
+      "Use --strata-ratio within sites, or --strata-quota without a site field."
+    )
+  }
   opt$site <- site
   opt
 }

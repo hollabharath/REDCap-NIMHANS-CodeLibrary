@@ -415,6 +415,15 @@ validate_params <- function(p) {
       errs <- c(errs, "strata_quota / strata_ratio require stratum fields.")
     }
   }
+  if (!is.null(p$strata_quota) && !is.null(p$site)) {
+    # Absolute stratum N is global. Nesting under sites silently reused those
+    # numbers as identical within-site proportions (site_quota × strata_quota).
+    errs <- c(errs, paste(
+      "Do not combine strata_quota with group/site stratification.",
+      "Use strata_ratio to weight strata within each site budget,",
+      "or remove the site/DAG field and use strata_quota alone."
+    ))
+  }
   if (!is.null(p$n_per_stratum) && (!is.null(p$strata_quota) || !is.null(p$strata_ratio))) {
     errs <- c(errs, "Do not combine n_per_stratum with strata_quota / strata_ratio.")
   }
@@ -545,7 +554,8 @@ has_strata_plan <- function(p) {
   length(p$strata) > 0 && (!is.null(p$strata_quota) || !is.null(p$strata_ratio))
 }
 
-# Split a budget across rows of a stratum-only grid using equal / ratio / quota.
+# Split a site (or overall) budget across stratum-grid rows using equal / ratio.
+# Absolute strata_quota is handled separately and must not be nested under sites.
 allocate_strata_budget <- function(budget, strata_grid, p) {
   n <- nrow(strata_grid)
   if (n == 0) {
@@ -554,21 +564,12 @@ allocate_strata_budget <- function(budget, strata_grid, p) {
   if (n == 1) {
     return(as.integer(budget))
   }
-  strata_names <- names(p$strata)
   if (!is.null(p$strata_quota)) {
-    if (length(p$strata) == 1) {
-      q <- vapply(seq_len(n), function(i) {
-        code <- as.character(strata_grid[i, 1])
-        as.numeric(p$strata_quota[[code]])
-      }, numeric(1))
-    } else {
-      q <- vapply(seq_len(n), function(i) {
-        key <- combo_strata_key(strata_grid[i, , drop = FALSE], strata_names)
-        as.numeric(p$strata_quota[[key]])
-      }, numeric(1))
-    }
-    # Quotas are planned N before buffer; scale to this budget while keeping proportions.
-    return(allocate_by_weights(budget, q))
+    stop(
+      "Internal error: strata_quota must not be nested under a site budget. ",
+      "Use strata_ratio within sites, or strata_quota without a site field.",
+      call. = FALSE
+    )
   }
   if (!is.null(p$strata_ratio)) {
     w <- vapply(seq_len(n), function(i) {

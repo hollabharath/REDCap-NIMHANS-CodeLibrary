@@ -162,7 +162,7 @@ ui <- shiny::fluidPage(
           ),
           shiny::conditionalPanel(
             "input.strata_alloc_mode == 'quota'",
-            shiny::helpText("One planned N (before buffer) per stratum combination."),
+            shiny::helpText("One planned N (before buffer) per stratum combination. Not available together with group/site stratification — use ratio weights within sites, or turn site off."),
             shiny::uiOutput("strata_quota_ui")
           )
         )
